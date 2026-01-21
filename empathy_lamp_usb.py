@@ -6,6 +6,8 @@ from typing import Optional
 import cv2
 from deepface import DeepFace
 
+STRESS_PAUSE_SECONDS = 30.0
+
 @dataclass
 class SharedState:
     lock: threading.Lock
@@ -60,16 +62,19 @@ def ai_loop(period_s: float = 3.0, ai_width: int = 640) -> None:
 
         with state.lock:
             pause_until = state.stressed_pause_until
-            if pause_until is not None and now < pause_until:
+
+        if pause_until is not None:
+            remaining = pause_until - now
+            if remaining > 0:
+                print(f"[AI] stressed pause remaining: {int(remaining)}s")
                 continue
+            with state.lock:
+                state.stressed_pause_until = None
+
+        with state.lock:
             if state.latest_frame_bgr is None:
                 continue
             frame = state.latest_frame_bgr.copy()
-
-        # Clear expired pause outside main lock to keep loop short
-        if pause_until is not None and now >= pause_until:
-            with state.lock:
-                state.stressed_pause_until = None
 
         # Downscale for AI speed
         h, w = frame.shape[:2]
@@ -112,13 +117,13 @@ def ai_loop(period_s: float = 3.0, ai_width: int = 640) -> None:
                 if dominant != prev:
                     state.current_emotion = dominant
                 if start_pause:
-                    state.stressed_pause_until = time.time() + 180
+                    state.stressed_pause_until = time.time() + STRESS_PAUSE_SECONDS
 
             if dominant != prev:
                 print(f"[AI] {prev} -> {dominant}")
                 lamp_set_color(dominant)
             if start_pause:
-                print("[AI] stressed detected, pausing analysis for 180s")
+                print(f"[AI] stressed detected, pausing analysis for {int(STRESS_PAUSE_SECONDS)}s")
 
         except Exception as e:
             print(f"[AI] error: {e}")
