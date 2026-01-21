@@ -11,6 +11,7 @@ class SharedState:
     lock: threading.Lock
     latest_frame_bgr: Optional["cv2.Mat"] = None
     current_emotion: str = "neutral"
+    stressed_pause_until: Optional[float] = None
 
 state = SharedState(lock=threading.Lock())
 
@@ -23,7 +24,7 @@ def camera_loop(device_index: int = 0) -> None:
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FPS, 60)
 
     if not cap.isOpened():
         raise RuntimeError("Could not open USB camera. Try device_index=0 or 1.")
@@ -55,11 +56,20 @@ def camera_loop(device_index: int = 0) -> None:
 def ai_loop(period_s: float = 3.0, ai_width: int = 640) -> None:
     while True:
         time.sleep(period_s)
+        now = time.time()
 
         with state.lock:
+            pause_until = state.stressed_pause_until
+            if pause_until is not None and now < pause_until:
+                continue
             if state.latest_frame_bgr is None:
                 continue
             frame = state.latest_frame_bgr.copy()
+
+        # Clear expired pause outside main lock to keep loop short
+        if pause_until is not None and now >= pause_until:
+            with state.lock:
+                state.stressed_pause_until = None
 
         # Downscale for AI speed
         h, w = frame.shape[:2]
@@ -76,20 +86,39 @@ def ai_loop(period_s: float = 3.0, ai_width: int = 640) -> None:
                 enforce_detection=False,
             )
 
-            dominant = result[0]["dominant_emotion"]
+            # Use probabilities to make stressed easier to trigger
+            emotions = result[0].get("emotion", {}) or {}
+            dominant_raw = result[0]["dominant_emotion"]
 
-            # 3-emotion output + neutral fallback
-            if dominant not in {"happy", "sad", "angry"}:
+            happy_score = float(emotions.get("happy", 0.0))
+            neutral_score = float(emotions.get("neutral", 0.0))
+            stressed_score = float(emotions.get("angry", 0.0)) + float(emotions.get("sad", 0.0)) + float(emotions.get("fear", 0.0)) + float(emotions.get("disgust", 0.0))
+
+            top_emotion = max(emotions, key=emotions.get) if emotions else dominant_raw
+            top_score = float(emotions.get(top_emotion, 0.0))
+
+            stressed_likely = stressed_score >= 35 or (top_emotion in {"angry", "sad"} and top_score >= 20)
+
+            if stressed_likely:
+                dominant = "stressed"
+            elif happy_score >= 35 and happy_score >= stressed_score:
+                dominant = "happy"
+            else:
                 dominant = "neutral"
+            start_pause = dominant == "stressed"
 
             with state.lock:
                 prev = state.current_emotion
                 if dominant != prev:
                     state.current_emotion = dominant
+                if start_pause:
+                    state.stressed_pause_until = time.time() + 180
 
             if dominant != prev:
                 print(f"[AI] {prev} -> {dominant}")
                 lamp_set_color(dominant)
+            if start_pause:
+                print("[AI] stressed detected, pausing analysis for 180s")
 
         except Exception as e:
             print(f"[AI] error: {e}")
